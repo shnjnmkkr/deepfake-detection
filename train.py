@@ -22,7 +22,7 @@ def train_epoch(model, train_loader, criterion, optimizer, device, epoch, num_ep
     # Create progress bar for batches
     pbar = tqdm(train_loader, 
                 desc=f'Epoch [{epoch}/{num_epochs}] Training',
-                leave=False)  # Don't leave the progress bar
+                leave=False)  
     
     with torch.amp.autocast(device_type='cuda', dtype=torch.float16):  # Updated autocast
         for frames, labels in pbar:
@@ -126,8 +126,8 @@ def plot_roc_curve(labels, probs, save_path):
 
 def main():
     # Set random seed for reproducibility
-    torch.manual_seed(42)
-    np.random.seed(42)
+    torch.manual_seed(27)
+    np.random.seed(27)
     
     # Speed-optimized hyperparameters
     BATCH_SIZE = 32
@@ -156,7 +156,7 @@ def main():
         root_dir="C:\\Users\\User\\Work\\College\\AIMS\\deepfake\\deepfake-detection\\dataset",
         split='train',
         transform=transform,
-        num_frames=8  # Reduce number of frames
+        num_frames=8  # Reduced number of frames
     )
     
     # Use a portion of training data as validation set
