@@ -12,38 +12,46 @@ import numpy as np
 from model import DeepFakeDetector
 from dataset import DeepFakeDataset
 
-def train_epoch(model, train_loader, criterion, optimizer, device):
+def train_epoch(model, train_loader, criterion, optimizer, device, epoch, num_epochs):
     """Train for one epoch."""
     model.train()
     total_loss = 0
     all_preds = []
     all_labels = []
     
-    pbar = tqdm(train_loader, desc='Training')
-    for frames, labels in pbar:
-        frames = frames.to(device)
-        labels = labels.float().to(device)
-        
-        optimizer.zero_grad()
-        outputs = model(frames)
-        loss = criterion(outputs.squeeze(), labels)
-        
-        loss.backward()
-        optimizer.step()
-        
-        total_loss += loss.item()
-        preds = (outputs.squeeze() > 0.5).float()
-        
-        all_preds.extend(preds.cpu().numpy())
-        all_labels.extend(labels.cpu().numpy())
-        
-        pbar.set_postfix({'loss': loss.item()})
+    # Create progress bar for batches
+    pbar = tqdm(train_loader, 
+                desc=f'Epoch [{epoch}/{num_epochs}] Training',
+                leave=False)  # Don't leave the progress bar
+    
+    with torch.amp.autocast(device_type='cuda', dtype=torch.float16):  # Updated autocast
+        for frames, labels in pbar:
+            frames = frames.to(device, non_blocking=True)
+            labels = labels.float().to(device, non_blocking=True)
+            
+            optimizer.zero_grad(set_to_none=True)
+            outputs = model(frames)
+            loss = criterion(outputs.squeeze(), labels)
+            
+            loss.backward()
+            optimizer.step()
+            
+            total_loss += loss.item()
+            preds = (torch.sigmoid(outputs.squeeze()) > 0.5).float()
+            
+            all_preds.extend(preds.cpu().numpy())
+            all_labels.extend(labels.cpu().numpy())
+            
+            # Update progress bar with current loss
+            pbar.set_postfix({'loss': f'{loss.item():.4f}'})
     
     metrics = calculate_metrics(all_labels, all_preds)
     metrics['loss'] = total_loss / len(train_loader)
+    metrics['labels'] = all_labels
+    metrics['preds'] = all_preds
     return metrics
 
-def evaluate(model, test_loader, criterion, device):
+def evaluate(model, test_loader, criterion, device, epoch, num_epochs):
     """Evaluate the model."""
     model.eval()
     total_loss = 0
@@ -51,25 +59,35 @@ def evaluate(model, test_loader, criterion, device):
     all_labels = []
     all_probs = []
     
-    with torch.no_grad():
-        for frames, labels in tqdm(test_loader, desc='Evaluating'):
-            frames = frames.to(device)
-            labels = labels.float().to(device)
+    # Create progress bar for validation
+    pbar = tqdm(test_loader, 
+                desc=f'Epoch [{epoch}/{num_epochs}] Validating',
+                leave=False)
+    
+    with torch.no_grad(), torch.amp.autocast(device_type='cuda', dtype=torch.float16):
+        for frames, labels in pbar:
+            frames = frames.to(device, non_blocking=True)
+            labels = labels.float().to(device, non_blocking=True)
             
             outputs = model(frames)
             loss = criterion(outputs.squeeze(), labels)
             
             total_loss += loss.item()
-            probs = outputs.squeeze().cpu().numpy()
+            probs = torch.sigmoid(outputs.squeeze()).cpu().numpy()
             preds = (probs > 0.5).astype(float)
             
             all_preds.extend(preds)
             all_labels.extend(labels.cpu().numpy())
             all_probs.extend(probs)
+            
+            # Update progress bar with current loss
+            pbar.set_postfix({'loss': f'{loss.item():.4f}'})
     
     metrics = calculate_metrics(all_labels, all_preds)
     metrics['loss'] = total_loss / len(test_loader)
     metrics['probs'] = all_probs
+    metrics['labels'] = all_labels
+    metrics['preds'] = all_preds
     return metrics
 
 def calculate_metrics(labels, preds):
@@ -111,56 +129,65 @@ def main():
     torch.manual_seed(42)
     np.random.seed(42)
     
-    # Hyperparameters - optimized for M1 Mac
-    BATCH_SIZE = 4  # Reduced batch size
-    LEARNING_RATE = 2e-4  # Slightly increased learning rate for faster convergence
-    NUM_EPOCHS = 10  # Reduced epochs for quick training
+    # Speed-optimized hyperparameters
+    BATCH_SIZE = 32
+    LEARNING_RATE = 1e-3
+    NUM_EPOCHS = 10
     
-    # Device configuration - optimized for M1
-    device = torch.device('mps' if torch.backends.mps.is_available() else 'cpu')
-    print(f"Using device: {device}")
+    # Device configuration
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    if device.type == 'cpu':
+        print("WARNING: GPU (CUDA) is not available. Training on CPU will be slower.")
+    else:
+        print(f"Using GPU: {torch.cuda.get_device_name(0)}")
+        # Enable cuDNN auto-tuner
+        torch.backends.cudnn.benchmark = True
     
-    # Data transforms - reduced image size
+    # Minimal data transforms
     transform = transforms.Compose([
-        transforms.Resize((160, 160)),  # Reduced image size
+        transforms.Resize((112, 112)),  # Smaller size
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406],
                            std=[0.229, 0.224, 0.225])
     ])
     
-    # Create datasets
+    # Modify dataset to use fewer frames
     train_dataset = DeepFakeDataset(
-        root_dir='dataset',
+        root_dir="C:\\Users\\User\\Work\\College\\AIMS\\deepfake\\deepfake-detection\\dataset",
         split='train',
-        transform=transform
+        transform=transform,
+        num_frames=8  # Reduce number of frames
     )
     
-    test_dataset = DeepFakeDataset(
-        root_dir='dataset',
-        split='test',
-        transform=transform
+    # Use a portion of training data as validation set
+    train_size = int(0.8 * len(train_dataset))
+    val_size = len(train_dataset) - train_size
+    train_dataset, test_dataset = torch.utils.data.random_split(
+        train_dataset, [train_size, val_size]
     )
     
-    # Create data loaders - reduced workers
+    # Fast training setup
     train_loader = DataLoader(
         train_dataset,
         batch_size=BATCH_SIZE,
         shuffle=True,
-        num_workers=2  # Reduced workers
+        num_workers=4,
+        pin_memory=True,
+        persistent_workers=True
     )
     
     test_loader = DataLoader(
         test_dataset,
-        batch_size=BATCH_SIZE,
+        batch_size=BATCH_SIZE * 2,
         shuffle=False,
-        num_workers=2  # Reduced workers
+        num_workers=4,
+        pin_memory=True,
+        persistent_workers=True
     )
     
-    # Initialize model
+    # Simple training setup
     model = DeepFakeDetector().to(device)
-    
-    # Loss function and optimizer
-    criterion = nn.BCELoss()
+    criterion = nn.BCEWithLogitsLoss()
     optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
     
     # Create output directory
@@ -168,16 +195,23 @@ def main():
     
     # Training loop
     best_auc = 0
-    for epoch in range(NUM_EPOCHS):
-        print(f'\nEpoch {epoch+1}/{NUM_EPOCHS}')
-        
+    # Create progress bar for epochs
+    epoch_pbar = tqdm(range(NUM_EPOCHS), desc='Training Progress')
+    
+    for epoch in epoch_pbar:
         # Train
-        train_metrics = train_epoch(model, train_loader, criterion, optimizer, device)
-        print('Training metrics:', train_metrics)
+        train_metrics = train_epoch(model, train_loader, criterion, optimizer, device, epoch+1, NUM_EPOCHS)
         
         # Evaluate
-        test_metrics = evaluate(model, test_loader, criterion, device)
-        print('Test metrics:', test_metrics)
+        test_metrics = evaluate(model, test_loader, criterion, device, epoch+1, NUM_EPOCHS)
+        
+        # Update epoch progress bar with metrics
+        epoch_pbar.set_postfix({
+            'train_loss': f"{train_metrics['loss']:.4f}",
+            'train_acc': f"{train_metrics['accuracy']:.4f}",
+            'val_loss': f"{test_metrics['loss']:.4f}",
+            'val_acc': f"{test_metrics['accuracy']:.4f}"
+        })
         
         # Save best model
         if test_metrics['auc'] > best_auc:

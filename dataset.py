@@ -87,15 +87,21 @@ class SuperResolution:
 
 class DeepFakeDataset(Dataset):
     """Dataset class for DeepFake detection."""
-    def __init__(self, root_dir, split='train', transform=None):
-        self.root_dir = root_dir
+    def __init__(self, root_dir, split='train', transform=None, num_frames=8):
+        self.root_dir = os.path.abspath(root_dir)  # Convert to absolute path
         self.split = split
         self.transform = transform
-        self.num_frames = 15  # Fixed number of frames
+        self.num_frames = num_frames  # Use this instead of fixed 15 frames
         
-        # Set paths
-        self.real_dir = os.path.join(root_dir, split, 'real')
-        self.fake_dir = os.path.join(root_dir, split, 'fake')
+        # Set paths using os.path.join for proper path handling
+        self.real_dir = os.path.join(self.root_dir, split, 'real')
+        self.fake_dir = os.path.join(self.root_dir, split, 'fake')
+        
+        # Check if directories exist
+        if not os.path.exists(self.real_dir):
+            raise FileNotFoundError(f"Real directory not found: {self.real_dir}")
+        if not os.path.exists(self.fake_dir):
+            raise FileNotFoundError(f"Fake directory not found: {self.fake_dir}")
         
         # Get all video files
         self.real_videos = [f for f in os.listdir(self.real_dir) if f.endswith('.mp4')]

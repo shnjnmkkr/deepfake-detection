@@ -2,6 +2,7 @@ import torch
 import math
 import torch.nn as nn
 import torchvision.models as models
+from einops import rearrange, repeat
 from torch.nn import TransformerEncoder, TransformerEncoderLayer
 
 class PositionalEncoding(nn.Module):
@@ -23,67 +24,119 @@ class PositionalEncoding(nn.Module):
         pe[:, 1::2] = torch.cos(position * self.div_term)
         return x + pe
 
-class DeepFakeDetector(nn.Module):
-    """Hybrid CNN-Transformer model for DeepFake detection."""
-    def __init__(self):
+class SpatialTemporalEncoder(nn.Module):
+    def __init__(self, dim=512, depth=4, heads=8, dim_head=64, mlp_dim=1024, dropout=0.1):
         super().__init__()
-        # Use a smaller ResNet variant
-        self.cnn = models.resnet18(weights='DEFAULT')
-        self.cnn_out_dim = 512  # ResNet18 output dimension
-        
-        # Remove the final fully connected layer
-        self.cnn = nn.Sequential(*list(self.cnn.children())[:-1])
-        
-        # Transformer encoder with smaller dimensions
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=self.cnn_out_dim,
-            nhead=8,
-            dim_feedforward=512,  # Reduced from 1024
-            batch_first=True
-        )
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=1)  # Reduced from 2
-        
-        # Final classification layer
-        self.classifier = nn.Sequential(
-            nn.Linear(self.cnn_out_dim, 128),  # Reduced from 256
-            nn.ReLU(),
-            nn.Dropout(0.5),
-            nn.Linear(128, 1),
-            nn.Sigmoid()
-        )
-        
-        self.pos_encoder = PositionalEncoding(self.cnn_out_dim)
+        self.layers = nn.ModuleList([])
+        for _ in range(depth):
+            self.layers.append(nn.ModuleList([
+                nn.LayerNorm(dim),
+                TransformerEncoderLayer(
+                    d_model=dim,
+                    nhead=heads,
+                    dim_feedforward=mlp_dim,
+                    dropout=dropout,
+                    batch_first=True
+                ),
+                nn.LayerNorm(dim),
+                TransformerEncoderLayer(
+                    d_model=dim,
+                    nhead=heads,
+                    dim_feedforward=mlp_dim,
+                    dropout=dropout,
+                    batch_first=True
+                )
+            ]))
 
     def forward(self, x):
-        """
-        Args:
-            x: Tensor of shape (batch_size, num_frames, height, width, channels)
-        Returns:
-            Tensor of shape (batch_size, 1) containing classification probabilities
-        """
-        # Input shape: (batch_size, num_frames, height, width, channels)
-        batch_size, num_frames, h, w, c = x.shape
+        for spatial_norm, spatial_trans, temporal_norm, temporal_trans in self.layers:
+            # Spatial attention
+            x = spatial_norm(x)
+            x = spatial_trans(x)
+            # Temporal attention 
+            x = temporal_norm(x)
+            x = temporal_trans(x)
+        return x
+
+class DeepFakeDetector(nn.Module):
+    """ViViT-based DeepFake detection model"""
+    def __init__(self, 
+                 num_frames=15,
+                 patch_size=16,
+                 dim=512,
+                 depth=4,
+                 heads=8,
+                 mlp_dim=1024,
+                 pool='cls',
+                 channels=3,
+                 dim_head=64,
+                 dropout=0.1,
+                 emb_dropout=0.1):
+        super().__init__()
         
-        # Reshape and permute for CNN: (batch_size * num_frames, channels, height, width)
-        x = x.view(-1, h, w, c)  # First reshape to (batch_size * num_frames, h, w, c)
-        x = x.permute(0, 3, 1, 2)  # Then permute to (batch_size * num_frames, c, h, w)
+        # Image patches
+        self.patch_size = patch_size
+        self.num_frames = num_frames
         
-        # Get CNN features
-        features = self.cnn(x)  # (batch_size * num_frames, 512, 1, 1)
-        features = features.squeeze(-1).squeeze(-1)  # (batch_size * num_frames, 512)
+        # Backbone CNN (ResNet50 with (2+1)D convolutions)
+        self.backbone = models.video.r2plus1d_18(pretrained=True)
+        self.backbone.fc = nn.Identity()  # Remove classifier
         
-        # Reshape for transformer: (batch_size, num_frames, 512)
-        features = features.view(batch_size, num_frames, -1)
+        # Patch embedding
+        self.to_patch_embedding = nn.Sequential(
+            nn.Linear(512, dim),
+            nn.LayerNorm(dim),
+        )
+
+        # Position embeddings
+        self.pos_embedding = nn.Parameter(torch.randn(1, num_frames + 1, dim))
+        self.cls_token = nn.Parameter(torch.randn(1, 1, dim))
+        self.dropout = nn.Dropout(emb_dropout)
+
+        # Transformer encoder
+        self.transformer = SpatialTemporalEncoder(
+            dim=dim,
+            depth=depth,
+            heads=heads,
+            dim_head=dim_head,
+            mlp_dim=mlp_dim,
+            dropout=dropout
+        )
+
+        # MLP head
+        self.mlp_head = nn.Sequential(
+            nn.LayerNorm(dim),
+            nn.Linear(dim, mlp_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(mlp_dim, 1)
+        )
+
+        self.pool = pool
+
+    def forward(self, x):
+        # Input shape: (batch, frames, channels, height, width)
+        b, f, c, h, w = x.shape
         
-        # Add positional encoding
-        features = self.pos_encoder(features)
+        # Extract features using backbone
+        x = x.view(-1, c, h, w)  # Reshape for CNN
+        x = self.backbone(x)
         
-        # Transformer
-        features = self.transformer(features)
+        # Create patches
+        x = self.to_patch_embedding(x)
+        x = x.view(b, f, -1)  # Reshape back to sequence
         
-        # Global average pooling
-        features = features.mean(dim=1)  # (batch_size, 512)
+        # Add cls token
+        cls_tokens = repeat(self.cls_token, '1 1 d -> b 1 d', b=b)
+        x = torch.cat((cls_tokens, x), dim=1)
         
-        # Classification
-        output = self.classifier(features)
-        return output 
+        # Add position embedding
+        x += self.pos_embedding[:, :(x.shape[1])]
+        x = self.dropout(x)
+        
+        # Apply transformer
+        x = self.transformer(x)
+        
+        # Pool and classify
+        x = x.mean(dim=1) if self.pool == 'mean' else x[:, 0]
+        return self.mlp_head(x) 
