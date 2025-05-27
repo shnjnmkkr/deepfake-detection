@@ -111,19 +111,18 @@ def main():
     torch.manual_seed(42)
     np.random.seed(42)
     
-    # Hyperparameters
-    BATCH_SIZE = 8
-    LEARNING_RATE = 1e-4
-    NUM_EPOCHS = 50
-    USE_SR = False  # Set to True to enable super-resolution
+    # Hyperparameters - optimized for M1 Mac
+    BATCH_SIZE = 4  # Reduced batch size
+    LEARNING_RATE = 2e-4  # Slightly increased learning rate for faster convergence
+    NUM_EPOCHS = 10  # Reduced epochs for quick training
     
-    # Device configuration
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    # Device configuration - optimized for M1
+    device = torch.device('mps' if torch.backends.mps.is_available() else 'cpu')
+    print(f"Using device: {device}")
     
-    # Data transforms
+    # Data transforms - reduced image size
     transform = transforms.Compose([
-        transforms.ToPILImage(),
-        transforms.Resize((224, 224)),
+        transforms.Resize((160, 160)),  # Reduced image size
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406],
                            std=[0.229, 0.224, 0.225])
@@ -133,34 +132,32 @@ def main():
     train_dataset = DeepFakeDataset(
         root_dir='dataset',
         split='train',
-        use_sr=USE_SR,
         transform=transform
     )
     
     test_dataset = DeepFakeDataset(
         root_dir='dataset',
         split='test',
-        use_sr=USE_SR,
         transform=transform
     )
     
-    # Create data loaders
+    # Create data loaders - reduced workers
     train_loader = DataLoader(
         train_dataset,
         batch_size=BATCH_SIZE,
         shuffle=True,
-        num_workers=4
+        num_workers=2  # Reduced workers
     )
     
     test_loader = DataLoader(
         test_dataset,
         batch_size=BATCH_SIZE,
         shuffle=False,
-        num_workers=4
+        num_workers=2  # Reduced workers
     )
     
     # Initialize model
-    model = DeepFakeDetector(use_sr=USE_SR).to(device)
+    model = DeepFakeDetector().to(device)
     
     # Loss function and optimizer
     criterion = nn.BCELoss()

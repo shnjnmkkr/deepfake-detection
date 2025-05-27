@@ -5,12 +5,11 @@ import numpy as np
 from torch.utils.data import Dataset
 from typing import Optional, Tuple, List
 import math
-from basicsr.archs.rrdbnet_arch import RRDBNet
-from basicsr.utils.download_util import load_file_from_url
+from PIL import Image
 
 class FrameExtractor:
     """Utility class for extracting frames from videos."""
-    def __init__(self, num_frames: int = 15):
+    def __init__(self, num_frames: int = 5):
         self.num_frames = num_frames
 
     def extract_frames(self, video_path: str) -> np.ndarray:
@@ -88,68 +87,81 @@ class SuperResolution:
 
 class DeepFakeDataset(Dataset):
     """Dataset class for DeepFake detection."""
-    def __init__(
-        self,
-        root_dir: str,
-        split: str = 'train',
-        num_frames: int = 15,
-        use_sr: bool = False,
-        transform = None
-    ):
-        """
-        Args:
-            root_dir: Path to dataset root directory
-            split: 'train' or 'test'
-            num_frames: Number of frames to extract per video
-            use_sr: Whether to apply super-resolution
-            transform: Optional transforms to apply to frames
-        """
-        self.root_dir = os.path.join(root_dir, split)
-        self.num_frames = num_frames
-        self.use_sr = use_sr
+    def __init__(self, root_dir, split='train', transform=None):
+        self.root_dir = root_dir
+        self.split = split
         self.transform = transform
+        self.num_frames = 15  # Fixed number of frames
         
-        self.frame_extractor = FrameExtractor(num_frames)
-        self.sr_model = SuperResolution() if use_sr else None
+        # Set paths
+        self.real_dir = os.path.join(root_dir, split, 'real')
+        self.fake_dir = os.path.join(root_dir, split, 'fake')
         
-        # Get all video paths and labels
-        self.video_paths = []
-        self.labels = []
+        # Get all video files
+        self.real_videos = [f for f in os.listdir(self.real_dir) if f.endswith('.mp4')]
+        self.fake_videos = [f for f in os.listdir(self.fake_dir) if f.endswith('.mp4')]
         
-        # Process real videos
-        real_dir = os.path.join(self.root_dir, 'real')
-        for video_name in os.listdir(real_dir):
-            if video_name.endswith(('.mp4', '.avi', '.mov')):
-                self.video_paths.append(os.path.join(real_dir, video_name))
-                self.labels.append(0)
-        
-        # Process fake videos
-        fake_dir = os.path.join(self.root_dir, 'fake')
-        for video_name in os.listdir(fake_dir):
-            if video_name.endswith(('.mp4', '.avi', '.mov')):
-                self.video_paths.append(os.path.join(fake_dir, video_name))
-                self.labels.append(1)
+        # Create video list with labels
+        self.videos = []
+        for video in self.real_videos:
+            self.videos.append((os.path.join(self.real_dir, video), 0))  # 0 for real
+        for video in self.fake_videos:
+            self.videos.append((os.path.join(self.fake_dir, video), 1))  # 1 for fake
+            
+        print(f"Found {len(self.videos)} videos in {split} split")
+        print(f"Real videos: {len(self.real_videos)}, Fake videos: {len(self.fake_videos)}")
 
-    def __len__(self) -> int:
-        return len(self.video_paths)
+    def __len__(self):
+        return len(self.videos)
 
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, int]:
-        video_path = self.video_paths[idx]
-        label = self.labels[idx]
+    def extract_frames(self, video_path):
+        frames = []
+        cap = cv2.VideoCapture(video_path)
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         
-        # Extract frames
-        frames = self.frame_extractor.extract_frames(video_path)
+        if total_frames == 0:
+            raise ValueError(f"Could not read video: {video_path}")
         
-        # Apply super-resolution if enabled
-        if self.use_sr:
-            frames = np.array([self.sr_model.enhance(frame) for frame in frames])
+        # Calculate frame indices to extract
+        indices = np.linspace(0, total_frames - 1, self.num_frames, dtype=int)
         
-        # Apply transforms if any
-        if self.transform:
-            frames = np.array([self.transform(frame) for frame in frames])
+        for idx in indices:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+            ret, frame = cap.read()
+            if ret:
+                frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                frame = Image.fromarray(frame)
+                
+                if self.transform:
+                    frame = self.transform(frame)
+                else:
+                    # Convert PIL Image to numpy array, then to tensor
+                    frame = np.array(frame)
+                    frame = torch.from_numpy(frame).float() / 255.0
+                    frame = frame.permute(2, 0, 1)  # Convert to (C, H, W)
+                
+                frames.append(frame)
+            else:
+                # Use a zero tensor as fallback
+                frames.append(torch.zeros(3, 160, 160))
         
-        # Convert to tensor
-        frames = torch.from_numpy(frames).float()
-        frames = frames.permute(0, 3, 1, 2)  # (num_frames, channels, height, width)
+        cap.release()
+        return frames
+
+    def __getitem__(self, idx):
+        video_path, label = self.videos[idx]
         
-        return frames, label 
+        try:
+            # Extract frames from video
+            frames = self.extract_frames(video_path)
+            
+            # Stack frames and ensure correct shape
+            frames = torch.stack(frames)  # Shape: (15, C, H, W)
+            frames = frames.permute(0, 2, 3, 1)  # Convert to (15, H, W, C)
+            
+            return frames, torch.tensor(label, dtype=torch.float32)
+            
+        except Exception as e:
+            print(f"Error processing video {video_path}: {str(e)}")
+            # Return a zero tensor as fallback
+            return torch.zeros(self.num_frames, 160, 160, 3), torch.tensor(label, dtype=torch.float32)

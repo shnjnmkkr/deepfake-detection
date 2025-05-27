@@ -1,89 +1,89 @@
 import torch
+import math
 import torch.nn as nn
 import torchvision.models as models
 from torch.nn import TransformerEncoder, TransformerEncoderLayer
 
 class PositionalEncoding(nn.Module):
     """Adds temporal positional encoding to the input sequence."""
-    def __init__(self, d_model, max_len=15):
+    def __init__(self, d_model):
         super().__init__()
-        position = torch.arange(max_len).unsqueeze(1)
         div_term = torch.exp(torch.arange(0, d_model, 2) * (-math.log(10000.0) / d_model))
-        pe = torch.zeros(max_len, 1, d_model)
-        pe[:, 0, 0::2] = torch.sin(position * div_term)
-        pe[:, 0, 1::2] = torch.cos(position * div_term)
-        self.register_buffer('pe', pe)
+        self.register_buffer('div_term', div_term)
 
     def forward(self, x):
         """
         Args:
             x: Tensor, shape [seq_len, batch_size, embedding_dim]
         """
-        x = x + self.pe[:x.size(0)]
-        return x
+        batch_size, seq_len, d_model = x.shape
+        position = torch.arange(seq_len, device=x.device).unsqueeze(1)
+        pe = torch.zeros(seq_len, d_model, device=x.device)
+        pe[:, 0::2] = torch.sin(position * self.div_term)
+        pe[:, 1::2] = torch.cos(position * self.div_term)
+        return x + pe
 
 class DeepFakeDetector(nn.Module):
     """Hybrid CNN-Transformer model for DeepFake detection."""
-    def __init__(self, num_frames=15, use_sr=False):
+    def __init__(self):
         super().__init__()
-        # CNN Backbone (ResNet50)
-        resnet = models.resnet50(pretrained=True)
-        self.cnn = nn.Sequential(*list(resnet.children())[:-1])  # Remove final FC layer
-        self.cnn_out_dim = 2048  # ResNet50 feature dimension
+        # Use a smaller ResNet variant
+        self.cnn = models.resnet18(weights='DEFAULT')
+        self.cnn_out_dim = 512  # ResNet18 output dimension
         
-        # Transformer components
-        self.pos_encoder = PositionalEncoding(self.cnn_out_dim)
-        encoder_layers = TransformerEncoderLayer(
+        # Remove the final fully connected layer
+        self.cnn = nn.Sequential(*list(self.cnn.children())[:-1])
+        
+        # Transformer encoder with smaller dimensions
+        encoder_layer = nn.TransformerEncoderLayer(
             d_model=self.cnn_out_dim,
             nhead=8,
-            dim_feedforward=2048,
-            dropout=0.1
+            dim_feedforward=512,  # Reduced from 1024
+            batch_first=True
         )
-        self.transformer_encoder = TransformerEncoder(encoder_layers, num_layers=3)
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=1)  # Reduced from 2
         
-        # Classifier
+        # Final classification layer
         self.classifier = nn.Sequential(
-            nn.Linear(self.cnn_out_dim, 512),
+            nn.Linear(self.cnn_out_dim, 128),  # Reduced from 256
             nn.ReLU(),
-            nn.Dropout(0.2),
-            nn.Linear(512, 128),
-            nn.ReLU(),
-            nn.Dropout(0.2),
+            nn.Dropout(0.5),
             nn.Linear(128, 1),
             nn.Sigmoid()
         )
         
-        self.use_sr = use_sr
+        self.pos_encoder = PositionalEncoding(self.cnn_out_dim)
 
     def forward(self, x):
         """
         Args:
-            x: Tensor of shape (batch_size, num_frames, channels, height, width)
+            x: Tensor of shape (batch_size, num_frames, height, width, channels)
         Returns:
             Tensor of shape (batch_size, 1) containing classification probabilities
         """
-        batch_size, num_frames, c, h, w = x.size()
+        # Input shape: (batch_size, num_frames, height, width, channels)
+        batch_size, num_frames, h, w, c = x.shape
         
-        # Reshape for CNN processing
-        x = x.view(-1, c, h, w)  # (batch_size * num_frames, c, h, w)
+        # Reshape and permute for CNN: (batch_size * num_frames, channels, height, width)
+        x = x.view(-1, h, w, c)  # First reshape to (batch_size * num_frames, h, w, c)
+        x = x.permute(0, 3, 1, 2)  # Then permute to (batch_size * num_frames, c, h, w)
         
-        # Extract features using CNN
-        features = self.cnn(x)  # (batch_size * num_frames, 2048, 1, 1)
-        features = features.squeeze(-1).squeeze(-1)  # (batch_size * num_frames, 2048)
+        # Get CNN features
+        features = self.cnn(x)  # (batch_size * num_frames, 512, 1, 1)
+        features = features.squeeze(-1).squeeze(-1)  # (batch_size * num_frames, 512)
         
-        # Reshape for transformer
-        features = features.view(batch_size, num_frames, -1)  # (batch_size, num_frames, 2048)
-        features = features.permute(1, 0, 2)  # (num_frames, batch_size, 2048)
+        # Reshape for transformer: (batch_size, num_frames, 512)
+        features = features.view(batch_size, num_frames, -1)
         
         # Add positional encoding
         features = self.pos_encoder(features)
         
-        # Apply transformer
-        transformer_out = self.transformer_encoder(features)
+        # Transformer
+        features = self.transformer(features)
         
-        # Use the output of the last frame for classification
-        last_frame_features = transformer_out[-1]  # (batch_size, 2048)
+        # Global average pooling
+        features = features.mean(dim=1)  # (batch_size, 512)
         
-        # Classify
-        output = self.classifier(last_frame_features)
+        # Classification
+        output = self.classifier(features)
         return output 
