@@ -16,7 +16,6 @@ The model combines:
 - Optional Real-ESRGAN super-resolution for frame enhancement
 - Hybrid CNN-Transformer architecture
 - Comprehensive metrics logging (accuracy, precision, recall, F1, AUC)
-- Confusion matrix and ROC curve visualization
 
 ## Requirements
 
